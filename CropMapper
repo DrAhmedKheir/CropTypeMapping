@@ -1,0 +1,188 @@
+https://code.earthengine.google.com/650068d92b10bdd0d851ad5a707c8384
+//The GEE script is on the upper link
+//from Assets import
+var AOI
+var Winter Crops 
+Map.setOptions('HYBRID');
+var AOI = AOI.geometry().buffer(10000);
+
+/*
+Performance and the Optimal Integration of Sentinel-1/2 Time-Series Features for Crop Classification in Northern Mongolia
+Object-Oriented Crop Classification Using Time Series Sentinel Images from Google Earth Engine
+*/
+
+function maskS2clouds(image) {
+  var qa = image.select('QA60');
+
+  // Bits 10 and 11 are clouds and cirrus, respectively.
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+
+  // Both flags should be set to zero, indicating clear conditions.
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+      .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+
+  return image.updateMask(mask).divide(10000);
+} 
+
+function indices(image){
+  var NDVI  = image.normalizedDifference(['B8','B4']).rename('NDVI');
+  var EVI   = image.expression('2.5*((NIR-R)/(NIR+6*R-7.5*B+1))', {'NIR':image.select('B8'), 'R':image.select('B4'), 'B':image.select('B3')}).rename('EVI');
+  
+  var GNDVI = image.normalizedDifference(['B8','B3']).rename('GNDVI');
+  var GCVI  = image.expression('(B8/(B3-1))', {'B8':image.select('B8'), 'B3':image.select('B3')}).rename('GCVI');
+  var WDRVI = image.expression('((0.1*B8)-B4)/((0.1*B8)+B4)', {'B8':image.select('B8'), 'B4':image.select('B4')}).rename('WDRVI');
+  
+  return image.addBands([NDVI, GNDVI, EVI, GCVI, WDRVI]);
+} 
+
+function maskEdge(imgage) {
+  var mask = imgage.select(0).unitScale(-25, 5).multiply(255).toByte().connectedComponents(ee.Kernel.rectangle(1,1), 100);
+  
+  var VH   = imgage.select('VH').focal_median(100, 'circle', 'meters');
+  var VV   = imgage.select('VV').focal_median(100, 'circle', 'meters');
+  
+  var VVVHs = VH.subtract(VV).rename('VVVHs');
+  var VVVHd = VH.divide(VV).rename('VVVHd');
+  
+  return imgage.addBands([VVVHs, VVVHd]).updateMask(mask.select(0)).toFloat();
+}
+
+function featureImportance(image, AOI, bands, samples, label, split, scale, classifier, description, folder){
+  
+  image = image.clip(AOI).reproject({crs:proj});
+  
+  samples = samples.randomColumn('random');
+  var trainingSamples = samples.filter(ee.Filter.lt('random', split));
+  var training = image.select(bands).sampleRegions({collection:trainingSamples, properties:[label], scale:scale, tileScale:1});
+
+  var explain = classifier.setOutputMode('MULTIPROBABILITY').train(training, label, bands).explain();
+      explain = ee.Dictionary(ee.Dictionary(explain).get('importance'));
+      var sum = explain.values().reduce(ee.Reducer.sum());
+      explain = explain.map(function(key, value){return ee.Number(value).divide(sum).multiply(100);});
+      explain = ee.FeatureCollection([ee.Feature(null, explain)]);
+  
+  var options = {title:'Feature Importance in ' + description, legend:{position:'none'}, hAxis:{title:'Bands'}, vAxis:{title:'Importance'}};
+  var chart   = ui.Chart.feature.byProperty(explain).setChartType('ColumnChart').setOptions(options);
+  // print(chart);
+  
+  Export.table.toDrive({collection:explain, selectors:bands, description:description+"_Importance", folder:folder});
+}
+
+function supervisedClassifier(image, AOI, bands, samples, label, split, scale, classifier, description, folder){
+  
+  image = image.clip(AOI).reproject({crs:proj});
+  
+  samples = samples.randomColumn('random');
+  var trainingSamples = samples.filter(ee.Filter.lt('random', split));
+  
+  var training = image.select(bands).sampleRegions({collection:trainingSamples, properties:[label], scale:scale});
+  
+  var model = classifier.train(training, label, bands);
+  
+  var classified = image.select(bands).classify(model).toInt().reproject({crs:proj});
+  // var palette = ["#ea5545", "#f46a9b", "#ef9b20", "#edbf33", "#ede15b", "#bdcf32", "#87bc45", "#27aeef", "#b33dc6", "#3A6B35", "#ede20b"];
+  // var max = ee.Number(ee.List(samples_2020.aggregate_histogram(label).keys()).length());
+  // Map.addLayer(classified, {min:1, max:max, palette:palette}, description, 0, 1);
+  Export.image.toDrive({image:classified, description:description+"_Classified", scale:scale, maxPixels:1e13, folder:folder});
+  
+  function getF1Scores4PAUAs(PAs, UAs){
+  
+    function getValue(innerList){
+      return ee.List(innerList).get(0);
+    }
+    
+    PAs = PAs.toList().map(getValue);
+    UAs = ee.List(UAs.toList().get(0));
+
+    var F1S = ee.List.sequence(0, PAs.length().subtract(1), 1).map(function(i){
+      var PA  = ee.Number(PAs.get(i));
+      var UA  = ee.Number(UAs.get(i));
+      return ee.Number(2).multiply(PA).multiply(UA).divide(PA.add(UA));
+      });
+
+    return ee.Array(F1S);
+  }
+
+  var testingSamples = samples.filter(ee.Filter.gte('random', split));
+  var validation = image.select(bands).sampleRegions({collection:testingSamples, properties:[label], scale:scale});
+  var validated = validation.classify(model);
+  
+  var TCM  = model.confusionMatrix();
+  var tUAs = TCM.consumersAccuracy();
+  var tPAs = TCM.producersAccuracy();
+  var tF1S = getF1Scores4PAUAs(tPAs, tUAs);
+
+  var VEM  = validated.errorMatrix(label, 'classification');
+  var vUAs = VEM.consumersAccuracy();
+  var vPAs = VEM.producersAccuracy();
+  var vF1S = getF1Scores4PAUAs(vPAs, vUAs);
+  
+  var TACC = ee.Feature(null,{"Type":              'Training',
+                              "Array":             TCM.array(),
+                              "Consumers Accuracy":tUAs,
+                              "Producers Accuracy":tPAs,
+                              "F1-Scores":tF1S,
+                              "Overall Accuracy"  :TCM.accuracy(),
+                              "kappa coefficient" :TCM.kappa()});
+                              
+  var VACC = ee.Feature(null,{"Type":             'Validation',
+                              "Array":             VEM.array(),
+                              "Consumers Accuracy":vUAs,
+                              "Producers Accuracy":vPAs,
+                              "F1-Scores":vF1S,
+                              "Overall Accuracy"  :VEM.accuracy(),
+                              "kappa coefficient" :VEM.kappa()});
+                            
+  var ACC = ee.FeatureCollection([TACC, VACC]);
+  var selectors = ['Type','Array','Consumers Accuracy','Producers Accuracy','F1-Scores','Overall Accuracy','kappa coefficient'];
+  Export.table.toDrive({collection:ACC, selectors:selectors, description:description+"_AccuracyReport", folder:folder});
+  
+  return 0;
+}
+
+var S2_SR = ee.ImageCollection('COPERNICUS/S2_SR');
+var proj = S2_SR.first().select('B2').projection();
+
+var S2_SR2020 = S2_SR.filterDate('2019-11-15', '2020-05-01').filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20)).map(maskS2clouds).map(indices).filterBounds(AOI).median();
+var S2_SR2021 = S2_SR.filterDate('2020-11-15', '2021-05-01').filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20)).map(maskS2clouds).map(indices).filterBounds(AOI).median();
+var S2_SR2022 = S2_SR.filterDate('2021-11-15', '2022-05-01').filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20)).map(maskS2clouds).map(indices).filterBounds(AOI).median();
+Map.addLayer(S2_SR2021, {min:0.0,max:0.3,bands:['B4','B3','B2']}, 'S2_SR2021', 1, 1);
+
+var S1_GRD = ee.ImageCollection('COPERNICUS/S1_GRD');
+
+var S1_GRD2020 = S1_GRD.filterDate('2019-11-15', '2020-05-01').filter(ee.Filter.eq('transmitterReceiverPolarisation', ["VV","VH"])).map(maskEdge).filterBounds(AOI).median();
+var S1_GRD2021 = S1_GRD.filterDate('2020-11-15', '2021-05-01').filter(ee.Filter.eq('transmitterReceiverPolarisation', ["VV","VH"])).map(maskEdge).filterBounds(AOI).median();
+var S1_GRD2022 = S1_GRD.filterDate('2021-11-15', '2022-05-01').filter(ee.Filter.eq('transmitterReceiverPolarisation', ["VV","VH"])).map(maskEdge).filterBounds(AOI).median();
+
+// var S2_SR2020 = S2_SR2020.addBands(S1_GRD2020);
+// var S2_SR2021 = S2_SR2021.addBands(S1_GRD2021);
+// var S2_SR2022 = S2_SR2022.addBands(S1_GRD2022);
+
+var bands = S2_SR2022.bandNames();
+print("Bands", bands);
+
+var bands = ['B2', 'B3','B4', 'B8', 'B11', 'B12', 'NDVI', 'GNDVI', 'EVI', 'GCVI'];
+// var bands = ['B2', 'B3','B4', 'B8', 'B11', 'B12', 'NDVI', 'GNDVI', 'EVI', 'GCVI','VV','VH','VVVHs','VVVHd'];
+
+var otherClasses = Water.merge(Urban).merge(Barren);
+var samples_2020 = WinterCrops.filter(ee.Filter.eq('Year', 2020)).merge(otherClasses).filterBounds(AOI);
+var samples_2021 = WinterCrops.filter(ee.Filter.eq('Year', 2021)).merge(otherClasses).filterBounds(AOI);
+var samples_2022 = WinterCrops.filter(ee.Filter.eq('Year', 2022)).merge(otherClasses).filterBounds(AOI);
+
+// print('samples_2020', samples_2020.aggregate_histogram('LULC'));
+// print('samples_2021', samples_2021.aggregate_histogram('LULC'));
+// print('samples_2022', samples_2022.aggregate_histogram('LULC'));
+
+var Classifier = ee.Classifier.smileRandomForest(128);
+
+featureImportance(S2_SR2020, AOI, bands, samples_2020, 'Class', 0.70, 10 , Classifier, 'WinterCrops_2020_S2', 'CropMapper');
+// featureImportance(S2_SR2021, AOI, bands, samples_2021, 'Class', 0.70, 10 , Classifier, 'WinterCrops_2021_S2', 'CropMapper');
+// featureImportance(S2_SR2022, AOI, bands, samples_2022, 'Class', 0.70, 10 , Classifier, 'WinterCrops_2022_S2', 'CropMapper');
+
+supervisedClassifier(S2_SR2020, AOI, bands, samples_2020, 'Class', 0.70, 10, Classifier, 'WinterCrops_2020_S2', 'CropMapper');
+// supervisedClassifier(S2_SR2021, AOI, bands, samples_2021, 'Class', 0.70, 10, Classifier, 'WinterCrops_2021_S2', 'CropMapper');
+// supervisedClassifier(S2_SR2022, AOI, bands, samples_2022, 'Class', 0.70, 10, Classifier, 'WinterCrops_2022_S2', 'CropMapper');
+
+Map.addLayer(AOI, {}, 'AOI', 1, 1);
+Map.addLayer(WinterCrops, {}, 'WinterCrops01', 1, 1);
